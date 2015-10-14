@@ -1,0 +1,135 @@
+diff --git a/examples/CMakeLists.txt b/examples/CMakeLists.txt
+index 5d4b5fc..d7e6586 100644
+--- a/examples/CMakeLists.txt
++++ b/examples/CMakeLists.txt
+@@ -8,3 +8,4 @@ add_subdirectory(analyzer-plugin)
+ endif()
+ add_subdirectory(clang-interpreter)
+ add_subdirectory(PrintFunctionNames)
++add_subdirectory(ffi-gen)
+\ No newline at end of file
+diff --git a/examples/Makefile b/examples/Makefile
+index d8d9028..35d4fb3 100644
+--- a/examples/Makefile
++++ b/examples/Makefile
+@@ -9,6 +9,6 @@
+ 
+ CLANG_LEVEL := ..
+ 
+-PARALLEL_DIRS := analyzer-plugin clang-interpreter PrintFunctionNames
++PARALLEL_DIRS := analyzer-plugin clang-interpreter PrintFunctionNames ffi-gen
+ 
+ include $(CLANG_LEVEL)/Makefile
+diff --git a/include/clang/Basic/Attr.td b/include/clang/Basic/Attr.td
+index 3ed7f8d..8a5b4d3 100644
+--- a/include/clang/Basic/Attr.td
++++ b/include/clang/Basic/Attr.td
+@@ -1969,6 +1969,12 @@ def CapturedRecord : InheritableAttr {
+   let Documentation = [Undocumented];
+ }
+ 
++def FFIBinding : Attr {
++  let Spellings = [GCC<"ffibinding">, Keyword<"__ffibinding">,
++                   Keyword<"_ffibinding">];
++  let Documentation = [Undocumented];
++}
++
+ def OMPThreadPrivateDecl : InheritableAttr {
+   // This attribute has no spellings as it is only ever created implicitly.
+   let Spellings = [];
+diff --git a/include/clang/Driver/Options.td b/include/clang/Driver/Options.td
+index b68a46b..f0e309d 100644
+--- a/include/clang/Driver/Options.td
++++ b/include/clang/Driver/Options.td
+@@ -1860,6 +1860,19 @@ defm stack_arrays : BooleanFFlag<"stack-arrays">, Group<gfortran_Group>;
+ defm underscoring : BooleanFFlag<"underscoring">, Group<gfortran_Group>;
+ defm whole_file : BooleanFFlag<"whole-file">, Group<gfortran_Group>;
+ 
++// ffi-gen plugin options
++def ffi_gen_enable : Flag<["-"], "ffi-gen-enable">,
++  HelpText<"Load ffi-gen plugin.">;
++def ffi_gen_test : Flag<["-"], "ffi-gen-test">,
++  HelpText<"Pass argument 'test' to ffi-gen plugin.">;
++def ffi_gen_output : Separate<["-"], "ffi-gen-output">,
++  HelpText<"Pass argument -output to ffi-gen plugin.">;
++def ffi_gen_header : Separate<["-"], "ffi-gen-header">,
++  HelpText<"Pass argument -header to ffi-gen plugin.">;
++def ffi_gen_blacklist : Separate<["-"], "ffi-gen-blacklist">,
++  HelpText<"Pass argument -blacklist to ffi-gen plugin.">;
++def ffi_gen_destdir : Separate<["-"], "ffi-gen-destdir">,
++  HelpText<"Pass argument -destdir to ffi-gen plugin.">;
+ 
+ include "CC1Options.td"
+ 
+diff --git a/lib/Driver/Tools.cpp b/lib/Driver/Tools.cpp
+index 75eef9e..d8eb46a 100644
+--- a/lib/Driver/Tools.cpp
++++ b/lib/Driver/Tools.cpp
+@@ -4430,6 +4430,51 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
+   // Forward -fparse-all-comments to -cc1.
+   Args.AddAllArgs(CmdArgs, options::OPT_fparse_all_comments);
+ 
++  // handle ffi-gen plugin options
++  if (Args.hasArg(options::OPT_ffi_gen_enable)) {
++    CmdArgs.push_back("-load");
++    CmdArgs.push_back(Args.MakeArgString(D.Dir + "/../lib/ffi-gen.so"));
++    CmdArgs.push_back("-add-plugin");
++    CmdArgs.push_back("ffi-gen");
++    
++    if (Args.hasArg(options::OPT_ffi_gen_test)) {
++      CmdArgs.push_back("-plugin-arg-ffi-gen");
++      CmdArgs.push_back("test"); 
++    }
++    
++    if (Args.hasArg(options::OPT_ffi_gen_output)) {
++      CmdArgs.push_back("-plugin-arg-ffi-gen");
++      CmdArgs.push_back("-output");
++      CmdArgs.push_back("-plugin-arg-ffi-gen");
++      Arg *A = Args.getLastArg(options::OPT_ffi_gen_output);
++      CmdArgs.push_back(A->getValue(0));
++    }
++
++    if (Args.hasArg(options::OPT_ffi_gen_header)) {
++      CmdArgs.push_back("-plugin-arg-ffi-gen");
++      CmdArgs.push_back("-header");
++      CmdArgs.push_back("-plugin-arg-ffi-gen");
++      Arg *A = Args.getLastArg(options::OPT_ffi_gen_header);
++      CmdArgs.push_back(A->getValue(0));
++    }
++  
++    if (Args.hasArg(options::OPT_ffi_gen_blacklist)) {
++      CmdArgs.push_back("-plugin-arg-ffi-gen");
++      CmdArgs.push_back("-blacklist");
++      CmdArgs.push_back("-plugin-arg-ffi-gen"); 
++      Arg *A = Args.getLastArg(options::OPT_ffi_gen_blacklist);
++      CmdArgs.push_back(A->getValue(0));
++    }
++
++    if (Args.hasArg(options::OPT_ffi_gen_destdir)) {
++      CmdArgs.push_back("-plugin-arg-ffi-gen");
++      CmdArgs.push_back("-destdir");
++      CmdArgs.push_back("-plugin-arg-ffi-gen"); 
++      Arg *A = Args.getLastArg(options::OPT_ffi_gen_destdir);
++      CmdArgs.push_back(A->getValue(0));
++    }
++  } 
++
+   // Forward -Xclang arguments to -cc1, and -mllvm arguments to the LLVM option
+   // parser.
+   Args.AddAllArgValues(CmdArgs, options::OPT_Xclang);
+diff --git a/lib/Sema/SemaDeclAttr.cpp b/lib/Sema/SemaDeclAttr.cpp
+index dcab25e..31fbcde 100644
+--- a/lib/Sema/SemaDeclAttr.cpp
++++ b/lib/Sema/SemaDeclAttr.cpp
+@@ -4780,6 +4780,11 @@ static void ProcessDeclAttribute(Sema &S, Scope *scope, Decl *D,
+   case AttributeList::AT_TypeTagForDatatype:
+     handleTypeTagForDatatypeAttr(S, D, Attr);
+     break;
++
++  // LuaJIT FFI binding attribute
++  case AttributeList::AT_FFIBinding:
++    handleSimpleAttribute<FFIBindingAttr>(S, D, Attr);
++    break;
+   }
+ }
+ 
