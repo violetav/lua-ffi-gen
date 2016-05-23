@@ -1,11 +1,8 @@
 #include "GenerateFFIBindings.hpp"
 
-void RecordVisitor::setOutput(llvm::raw_fd_ostream *output_) {
-  output = output_;
-}
+void RecordVisitor::setOutput(std::string *output_) { output = output_; }
 
-void RecordVisitor::checkFieldType(QualType FieldType, std::string FieldName,
-                                   bool *isResolved,
+void RecordVisitor::checkFieldType(QualType FieldType, bool *isResolved,
                                    std::vector<std::string> *dependencyList,
                                    std::string &RecordDeclaration) {
 
@@ -25,9 +22,7 @@ void RecordVisitor::checkFieldType(QualType FieldType, std::string FieldName,
 
       TypeDeclaration TypedefTypeDeclaration;
       TypedefTypeDeclaration.Declaration = TD;
-      TypedefTypeDeclaration.shouldBeResolved = false;
       TypedefTypeDeclaration.TypeName = "typedef " + FieldType.getAsString();
-
       *isResolved = false;
       dependencyList->push_back("typedef " + FieldType.getAsString());
 
@@ -37,7 +32,7 @@ void RecordVisitor::checkFieldType(QualType FieldType, std::string FieldName,
       }
     }
 
-    RecordDeclaration += FieldTypeFull.getAsString() + " " + FieldName + ";\n";
+    RecordDeclaration = FieldTypeFull.getAsString() + " " + RecordDeclaration;
 
   } else if (const RecordType *RT = FieldType->getAs<RecordType>()) {
     RecordDecl *RD = RT->getDecl();
@@ -46,8 +41,7 @@ void RecordVisitor::checkFieldType(QualType FieldType, std::string FieldName,
             FieldType.getAsString())) {
       FFIBindingsUtils::getInstance()->getResolvedDecls()->insert(
           RD->getTypeForDecl()->getCanonicalTypeInternal().getAsString());
-      RecordDeclaration +=
-          FieldTypeFull.getAsString() + " " + FieldName + ";\n";
+      RecordDeclaration = FieldTypeFull.getAsString() + " " + RecordDeclaration;
     } else {
 
       TypeDeclaration RecordTypeDeclaration;
@@ -61,28 +55,33 @@ void RecordVisitor::checkFieldType(QualType FieldType, std::string FieldName,
         std::string AnonRecordDeclaration;
 
         if (FieldType->isStructureType()) {
-          AnonRecordDeclaration += "struct {\n";
+          AnonRecordDeclaration += "struct ";
         } else if (FieldType->isUnionType()) {
-          AnonRecordDeclaration += "union {\n";
+          AnonRecordDeclaration += "union ";
         }
+
+        AnonRecordDeclaration +=
+            FFIBindingsUtils::getInstance()->getDeclAttrs(RD);
+        AnonRecordDeclaration += "{\n";
 
         // check the fields
         for (RecordDecl::field_iterator FI = RD->field_begin();
              FI != RD->field_end(); ++FI) {
-          checkFieldType(FI->getType(), FI->getNameAsString(), isResolved,
-                         dependencyList, AnonRecordDeclaration);
+          std::string FieldDeclaration = FI->getNameAsString();
+          checkFieldType(FI->getType(), isResolved, dependencyList,
+                         FieldDeclaration);
+          AnonRecordDeclaration += FieldDeclaration + ";\n";
         }
         AnonRecordDeclaration += "}";
 
         if (!RD->isAnonymousStructOrUnion()) {
-          AnonRecordDeclaration += " " + FieldName;
+          AnonRecordDeclaration += " ";
         }
-        AnonRecordDeclaration += ";\n";
 
-        RecordDeclaration += AnonRecordDeclaration;
+        RecordDeclaration = AnonRecordDeclaration + RecordDeclaration;
       } else {
-        RecordDeclaration +=
-            FieldTypeFull.getAsString() + " " + FieldName + ";\n";
+        RecordDeclaration =
+            FieldTypeFull.getAsString() + " " + RecordDeclaration;
         dependencyList->push_back(
             RD->getTypeForDecl()->getCanonicalTypeInternal().getAsString());
 
@@ -100,15 +99,16 @@ void RecordVisitor::checkFieldType(QualType FieldType, std::string FieldName,
             FieldType.getAsString())) {
       FFIBindingsUtils::getInstance()->getResolvedDecls()->insert(
           FieldType.getAsString());
-      RecordDeclaration +=
-          FieldTypeFull.getAsString() + " " + FieldName + ";\n";
+      RecordDeclaration = FieldTypeFull.getAsString() + " " + RecordDeclaration;
     } else {
       EnumDecl *ED = ET->getDecl();
 
       if (ED->getNameAsString() == "") {
         std::vector<std::string> elements;
+        std::string AnonEnumDeclaration;
 
-        RecordDeclaration += "enum {";
+        std::string attrs = FFIBindingsUtils::getInstance()->getDeclAttrs(ED);
+        AnonEnumDeclaration += "enum " + attrs + "{";
 
         int length = 0;
         for (EnumDecl::enumerator_iterator EI = ED->enumerator_begin();
@@ -119,19 +119,19 @@ void RecordVisitor::checkFieldType(QualType FieldType, std::string FieldName,
 
         for (int i = 0; i < length; i++) {
           if (i < length - 1) {
-            RecordDeclaration += elements[i] + ", ";
+            AnonEnumDeclaration += elements[i] + ", ";
           } else {
-            RecordDeclaration += elements[i] + "} ";
+            AnonEnumDeclaration += elements[i] + "} ";
           }
         }
-        RecordDeclaration += FieldName + ";\n";
+        RecordDeclaration = AnonEnumDeclaration + RecordDeclaration;
       } else {
         TypeDeclaration EnumTypeDeclaration;
         EnumTypeDeclaration.Declaration = ED;
         EnumTypeDeclaration.TypeName = FieldType.getAsString();
 
-        RecordDeclaration +=
-            FieldTypeFull.getAsString() + " " + FieldName + ";\n";
+        RecordDeclaration =
+            FieldTypeFull.getAsString() + " " + RecordDeclaration;
         *isResolved = false;
         dependencyList->push_back(FieldType.getAsString());
 
@@ -143,80 +143,66 @@ void RecordVisitor::checkFieldType(QualType FieldType, std::string FieldName,
     }
 
   } else if (FieldType->isFundamentalType()) {
-    RecordDeclaration += FieldTypeFull.getAsString() + " " + FieldName + ";\n";
+    RecordDeclaration = FieldTypeFull.getAsString() + " " + RecordDeclaration;
+  } else if (FieldType->isFunctionPointerType()) {
+    std::string FunctionPointerDeclarationCore;
+    const FunctionProtoType *FPT =
+        (const FunctionProtoType *)
+        FieldType->getPointeeType()->getAs<FunctionType>();
+    std::string ReturnValueDeclaration;
+    FunctionVisitor::checkParameterType(FPT->getReturnType(), isResolved,
+                                        dependencyList, ReturnValueDeclaration,
+                                        FunctionVisitor::RETVAL);
+    RecordDeclaration =
+        ReturnValueDeclaration + " (*" + RecordDeclaration + ")" + "(";
+    unsigned int NumOfParams = FPT->getNumParams();
+    for (unsigned int i = 0; i < NumOfParams; i++) {
+      std::string ParameterDeclaration;
+      FunctionVisitor::checkParameterType(FPT->getParamType(i), isResolved,
+                                          dependencyList, ParameterDeclaration,
+                                          FunctionVisitor::PARAM);
+      FunctionPointerDeclarationCore += ParameterDeclaration;
+      if (i != NumOfParams - 1) {
+        FunctionPointerDeclarationCore += ", ";
+      }
+    }
+    if (FPT->isVariadic()) {
+      FunctionPointerDeclarationCore += ", ...";
+    }
+    FunctionPointerDeclarationCore += ")";
+    RecordDeclaration += FunctionPointerDeclarationCore;
   } else if (FieldType->isPointerType()) {
     if (FieldType->getPointeeType()->isFundamentalType() &&
         !(FieldType->getPointeeType()->getAs<TypedefType>())) {
-      RecordDeclaration +=
-          FieldTypeFull.getAsString() + " " + FieldName + ";\n";
+      RecordDeclaration = FieldTypeFull.getAsString() + " " + RecordDeclaration;
     } else {
-      RecordDeclaration += "void* " + FieldName + ";\n";
+      RecordDeclaration = "(*" + RecordDeclaration + ")";
+      checkFieldType(FieldType->getPointeeType(), isResolved, dependencyList,
+                     RecordDeclaration);
     }
-
   } else if (FieldType->isArrayType()) {
-
     std::string ArrayDeclaration;
-
+    QualType ElementType;
     if (FieldType->isConstantArrayType()) {
-      const ConstantArrayType *CAT = Context->getAsConstantArrayType(FieldType);
-      ArrayDeclaration = FFIBindingsUtils::getInstance()->getArraySize(CAT);
-
-      // e.g. typedef int* INT_PTR; INT_PTR is a typedeftype and also a
-      // pointertype, so this has to be checked first
-      if (CAT->getElementType()->getAs<TypedefType>()) {
-        std::string TempArrayDeclaration;
-        checkFieldType(CAT->getElementType(), FieldName, isResolved,
-                       dependencyList, TempArrayDeclaration);
-        RecordDeclaration += CAT->getElementType().getAsString() + " " +
-                             FieldName + ArrayDeclaration + ";\n";
-      } else if (CAT->getElementType()->isPointerType()) {
-        if (CAT->getElementType()->getPointeeType()->isFundamentalType() &&
-            !(CAT->getElementType()->getPointeeType()->getAs<TypedefType>())) {
-          RecordDeclaration += CAT->getElementType().getAsString() + " " +
-                               FieldName + ArrayDeclaration + ";\n";
-        } else {
-          RecordDeclaration += "void* " + FieldName + ArrayDeclaration + ";\n";
-        }
-      } else {
-        std::string TempArrayDeclaration;
-        checkFieldType(CAT->getElementType(), FieldName, isResolved,
-                       dependencyList, TempArrayDeclaration);
-        if (CAT->getElementType()->isArrayType()) {
-          TempArrayDeclaration = "";
-          QualType elementType =
-              FFIBindingsUtils::getInstance()->handleMultiDimArrayType(
-                  Context, CAT->getElementType(), TempArrayDeclaration);
-
-          if (elementType->isPointerType()) {
-            if (elementType->getPointeeType()->isFundamentalType() &&
-                !(elementType->getPointeeType()->getAs<TypedefType>())) {
-              RecordDeclaration += elementType.getAsString() + " " + FieldName +
-                                   ArrayDeclaration + TempArrayDeclaration +
-                                   ";\n";
-            } else {
-              RecordDeclaration += "void* " + FieldName + ArrayDeclaration +
-                                   TempArrayDeclaration + ";\n";
-            }
-
-          } else {
-            RecordDeclaration += elementType.getAsString() + " " + FieldName +
-                                 ArrayDeclaration + TempArrayDeclaration +
-                                 ";\n";
-          }
-
-        } else {
-          RecordDeclaration += CAT->getElementType().getAsString() + " " +
-                               FieldName + ArrayDeclaration + ";\n";
-        }
-      }
+      ArrayDeclaration = FFIBindingsUtils::getInstance()->getArraySize(
+          Context->getAsConstantArrayType(FieldType));
+      ElementType =
+          Context->getAsConstantArrayType(FieldType)->getElementType();
+    } else if (FieldType->isIncompleteArrayType()) {
+      ArrayDeclaration = "[]";
+      ElementType =
+          Context->getAsIncompleteArrayType(FieldType)->getElementType();
     }
+    RecordDeclaration += ArrayDeclaration;
+    checkFieldType(ElementType, isResolved, dependencyList, RecordDeclaration);
   } else if (const VectorType *VT = FieldType->getAs<VectorType>()) {
     if (VT->getVectorKind() == VectorType::GenericVector &&
         VT->getElementType()->isFundamentalType()) {
-      RecordDeclaration += VT->getElementType().getAsString() + " " +
-                           FieldName + " __attribute__((__vector_size__(" +
-                           std::to_string(VT->getNumElements()) + " * sizeof(" +
-                           VT->getElementType().getAsString() + "))));\n";
+      RecordDeclaration = VT->getElementType().getAsString() + " " +
+                          RecordDeclaration +
+                          " __attribute__((__vector_size__(" +
+                          std::to_string(VT->getNumElements()) + " * sizeof(" +
+                          VT->getElementType().getAsString() + "))));\n";
     }
   }
 }
@@ -225,6 +211,7 @@ bool RecordVisitor::VisitRecordDecl(RecordDecl *RD) {
 
   // try to resolve record declaration if it has ffibinding attribute
   if (RD->hasAttr<FFIBindingAttr>()) {
+    FFIBindingsUtils::getInstance()->setHasMarkedDeclarations(true);
     // if this record type has already been resolved, then there's nothing to do
     if (!FFIBindingsUtils::getInstance()->isNewType(
              RD->getTypeForDecl()->getCanonicalTypeInternal())) {
@@ -241,20 +228,42 @@ void RecordVisitor::findRecordDeclaration(RecordDecl *RD) {
   std::string RecordDeclaration;
   std::vector<std::string> *dependencyList = new std::vector<std::string>();
 
-  RecordDeclaration =
-      RD->getTypeForDecl()->getCanonicalTypeInternal().getAsString() + " {\n";
+  std::string attrList = FFIBindingsUtils::getInstance()->getDeclAttrs(RD);
+
+  if (RD->getTypeForDecl()->isStructureType()) {
+    RecordDeclaration = "struct ";
+  } else if (RD->getTypeForDecl()->isUnionType()) {
+    RecordDeclaration = "union ";
+  }
+
+  RecordDeclaration += attrList + RD->getNameAsString() + " {\n";
+
   // check the fields
   for (RecordDecl::field_iterator FI = RD->field_begin(); FI != RD->field_end();
        ++FI) {
-    checkFieldType(FI->getType(), FI->getNameAsString(), &isResolved,
-                   dependencyList, RecordDeclaration);
+    if (FI->isBitField()) {
+      RecordDeclaration +=
+          FI->getType().getAsString() + " " + FI->getNameAsString() + " : " +
+          std::to_string(FI->getBitWidthValue(*Context)) + ";\n";
+      continue;
+    }
+    std::string FieldDeclaration = FI->getNameAsString();
+    checkFieldType(FI->getType(), &isResolved, dependencyList,
+                   FieldDeclaration);
+    RecordDeclaration += FieldDeclaration + ";\n";
   }
   RecordDeclaration += "};\n";
   if (isResolved) {
     FFIBindingsUtils::getInstance()->getResolvedDecls()->insert(
         RD->getTypeForDecl()->getCanonicalTypeInternal().getAsString());
-    (*output) << RecordDeclaration;
-    (*output) << "\n";
+    if (RD->field_empty()) {
+      (*output) +=
+          RD->getTypeForDecl()->getCanonicalTypeInternal().getAsString() +
+          ";\n";
+    } else {
+      (*output) += RecordDeclaration;
+    }
+    (*output) += "\n";
     delete dependencyList;
   } else {
     // add this record to list of unresolved declarations

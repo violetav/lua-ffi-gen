@@ -28,10 +28,6 @@
 class GenerateFFIBindingsConsumer : public ASTConsumer {
 public:
   GenerateFFIBindingsConsumer() {}
-  explicit GenerateFFIBindingsConsumer(ASTContext *Context)
-      : FunctionsVisitor(Context), RecordsVisitor(Context),
-        EnumsVisitor(Context), Context(Context) {}
-
   virtual void HandleTranslationUnit(clang::ASTContext &context) {
 
     DiagnosticsEngine &DE = context.getDiagnostics();
@@ -86,15 +82,6 @@ public:
 
     sourceFileName = ">> " + dirName + sourceFileName;
 
-    output = new llvm::raw_fd_ostream(utils->getDestinationDirectory() +
-                                          outputFileName,
-                                      Err, llvm::sys::fs::F_RW);
-    if (Err) {
-      llvm::errs() << "Error creating file \"" << outputFileName
-                   << "\" : " << Err.message() << "!\n";
-      return;
-    }
-
     if (headerFileName != "") {
       std::string line;
       std::ifstream headerFile(headerFileName);
@@ -106,7 +93,7 @@ public:
                          constants::SRC_FILE_PLACE_HOLDER.length(),
                          sourceFileName);
           }
-          (*output) << line << "\n";
+          output += line + "\n";
         }
         headerFile.close();
       } else {
@@ -129,20 +116,22 @@ public:
       }
     }
 
-    (*output) << "ffi = require(\"ffi\")\nffi.cdef[[\n\n";
+    output += "ffi = require(\"ffi\")\nffi.cdef[[\n\n";
 
-    FunctionsVisitor.setOutput(output);
-    RecordsVisitor.setOutput(output);
-    EnumsVisitor.setOutput(output);
+    FunctionsVisitor.setOutput(&output);
+    RecordsVisitor.setOutput(&output);
+    EnumsVisitor.setOutput(&output);
 
     // visit all function declarations and extract information
     // about unresolved dependencies, if there are any
     FunctionsVisitor.TraverseDecl(context.getTranslationUnitDecl());
     // visit all record declarations that are marked with ffibinding attribute
     // and start resolving them
+    RecordsVisitor.setContext(&context);
     RecordsVisitor.TraverseDecl(context.getTranslationUnitDecl());
     // visit all enum declarations that are marked with ffibinding attribute
     // and print them out
+    EnumsVisitor.setContext(&context);
     EnumsVisitor.TraverseDecl(context.getTranslationUnitDecl());
 
     // go through DeclsToFind until all required declarations are found
@@ -152,7 +141,6 @@ public:
       utils->getDeclsToFind()->pop();
 
       const Type *DeclType = Decl.Declaration->getTypeForDecl();
-
       if (!utils->isInResolvedDecls(Decl.TypeName) &&
           !utils->isInUnresolvedDeclarations(Decl.TypeName)) {
         if (DeclType->getAs<TypedefType>()) {
@@ -169,11 +157,11 @@ public:
         }
       }
     }
-
     unsigned int i = 0;
+    bool possibleLoop = false;
     while (i < utils->getUnresolvedDeclarations()->size()) {
-
       i = 0;
+      bool printedSomething = false;
       // iterate through the list of unresolved declarations until
       // they are all printed (become resolved);
       // declaration printing must be done in a certain order
@@ -207,20 +195,44 @@ public:
                                                     // resolved
           (*it).second.isResolved = true;
           utils->getResolvedDecls()->insert(DeclName);
-          (*output) << DeclInfo.Declaration; // print out the declaration
-          (*output) << "\n";
+          output += DeclInfo.Declaration; // print out the declaration
+          output += "\n";
+          printedSomething = true;
+          possibleLoop = false;
           delete DeclInfo.dependencyList;
         } else {
+          if (possibleLoop && !utils->isInResolvedDecls(DeclName) &&
+              DependsOnItself(DeclName, DeclInfo.dependencyList)) {
+            utils->getResolvedDecls()->insert(DeclName);
+            output += DeclName; // print out the forward declaration
+            output += ";\n";
+            printedSomething = true;
+            possibleLoop = false;
+          }
           continue; // if this declaration is not yet ready for printing, move
                     // on to the next one in the list
         }
       }
+      if (!printedSomething) {
+        possibleLoop = true;
+      }
     }
+    output += "]]\n";
 
-    (*output) << "]]\n";
-    (*output).close();
+    if (utils->hasMarkedDeclarations()) {
+      llvm::raw_fd_ostream *fileOutput = new llvm::raw_fd_ostream(
+          utils->getDestinationDirectory() + outputFileName, Err,
+          llvm::sys::fs::F_RW);
+      if (Err) {
+        llvm::errs() << "Error creating file \"" << outputFileName
+                     << "\" : " << Err.message() << "!\n";
+        return;
+      }
+      (*fileOutput) << output;
+      (*fileOutput).close();
+      delete fileOutput;
+    }
     delete utils;
-    delete output;
   }
 
 private:
@@ -228,7 +240,7 @@ private:
   RecordVisitor RecordsVisitor;
   EnumVisitor EnumsVisitor;
   ASTContext *Context;
-  llvm::raw_fd_ostream *output;
+  std::string output;
   FFIBindingsUtils *utils;
 
   void resolveEnumType(TypeDeclaration EnumTypeDeclaration) {
@@ -237,7 +249,8 @@ private:
     std::vector<std::string> elements;
     EnumDecl *ED = (EnumDecl *)EnumTypeDeclaration.Declaration;
 
-    EnumDeclaration = "enum " + ED->getNameAsString() + " {";
+    std::string attrs = FFIBindingsUtils::getInstance()->getDeclAttrs(ED);
+    EnumDeclaration = "enum " + attrs + ED->getNameAsString() + " {";
 
     int length = 0;
     for (EnumDecl::enumerator_iterator EI = ED->enumerator_begin();
@@ -254,15 +267,14 @@ private:
       }
     }
 
-    (*output) << EnumDeclaration; // print the enumeration
-    (*output) << "\n";
+    output += EnumDeclaration; // print the enumeration
+    output += "\n";
     utils->getResolvedDecls()->insert("enum " + ED->getNameAsString());
   }
 
   void resolveTypedefType(TypeDeclaration TypedefTypeDeclaration) {
 
     TypedefNameDecl *TD = (TypedefNameDecl *)TypedefTypeDeclaration.Declaration;
-    bool shouldBeResolved = TypedefTypeDeclaration.shouldBeResolved;
 
     std::string TypedefDeclaration = "typedef ";
 
@@ -309,8 +321,8 @@ private:
       TypedefDeclaration += UnderlyingTypeFull.getAsString() + " " +
                             TD->getNameAsString() + ";\n";
       utils->getResolvedDecls()->insert("typedef " + TD->getNameAsString());
-      (*output) << TypedefDeclaration;
-      (*output) << "\n";
+      output += TypedefDeclaration;
+      output += "\n";
     } else if (UnderlyingType->isRecordType()) {
 
       bool isResolved = false;
@@ -333,14 +345,17 @@ private:
           } else if (UnderlyingType->isUnionType()) {
             TypedefDeclaration += "union ";
           }
-
+          std::string attrList =
+              FFIBindingsUtils::getInstance()->getDeclAttrs(recordDecl);
+          TypedefDeclaration += attrList;
           TypedefDeclaration += "{\n";
 
           for (RecordDecl::field_iterator FI = recordDecl->field_begin();
                FI != recordDecl->field_end(); ++FI) {
-            RecordsVisitor.checkFieldType(FI->getType(), FI->getNameAsString(),
-                                          &isResolved, dependencyList,
-                                          AnonRecordDeclaration);
+            std::string FieldDeclaration = FI->getNameAsString();
+            RecordsVisitor.checkFieldType(FI->getType(), &isResolved,
+                                          dependencyList, FieldDeclaration);
+            AnonRecordDeclaration += FieldDeclaration + ";\n";
           }
 
           TypedefDeclaration += AnonRecordDeclaration;
@@ -389,6 +404,9 @@ private:
 
         std::vector<std::string> elements;
 
+        TypedefDeclaration +=
+            FFIBindingsUtils::getInstance()->getDeclAttrs(enumDecl);
+
         if (enumDecl->getNameAsString() != "") {
           TypedefDeclaration += enumDecl->getNameAsString() + " ";
         }
@@ -410,18 +428,52 @@ private:
         }
       }
       TypedefDeclaration += TD->getNameAsString() + ";\n";
-      (*output) << TypedefDeclaration; // print the typedef
-      (*output) << "\n";
+      output += TypedefDeclaration; // print the typedef
+      output += "\n";
 
       utils->getResolvedDecls()->insert("typedef " + TD->getNameAsString());
 
     } else if (UnderlyingType->isFunctionPointerType()) {
-      std::string TypedefDeclaration =
-          "typedef void* " + TD->getNameAsString() + ";\n";
-      (*output) << TypedefDeclaration; // print the typedef
-      (*output) << "\n";
+      std::string FunctionPointerDeclarationCore;
+      bool isResolved = false;
+      std::vector<std::string> *dependencyList = new std::vector<std::string>();
 
-      utils->getResolvedDecls()->insert("typedef " + TD->getNameAsString());
+      const FunctionProtoType *FPT =
+          (const FunctionProtoType *)
+          UnderlyingType->getPointeeType()->getAs<FunctionType>();
+      std::string ReturnValueDeclaration;
+      FunctionsVisitor.checkParameterType(
+          FPT->getReturnType(), &isResolved, dependencyList,
+          ReturnValueDeclaration, FunctionsVisitor.RETVAL);
+      std::string TypedefDeclaration = "typedef " + ReturnValueDeclaration +
+                                       " (*" + TD->getNameAsString() + ")" +
+                                       "(";
+      unsigned int NumOfParams = FPT->getNumParams();
+      for (unsigned int i = 0; i < NumOfParams; i++) {
+        std::string ParameterDeclaration;
+        FunctionsVisitor.checkParameterType(
+            FPT->getParamType(i), &isResolved, dependencyList,
+            ParameterDeclaration, FunctionsVisitor.PARAM);
+        FunctionPointerDeclarationCore += ParameterDeclaration;
+        if (i != NumOfParams - 1) {
+          FunctionPointerDeclarationCore += ", ";
+        }
+      }
+      if (FPT->isVariadic()) {
+        FunctionPointerDeclarationCore += ", ...";
+      }
+      FunctionPointerDeclarationCore += ");\n";
+      TypedefDeclaration += FunctionPointerDeclarationCore;
+
+      DeclarationInfo TypedefDeclarationInfo;
+      TypedefDeclarationInfo.isResolved = isResolved;
+      TypedefDeclarationInfo.dependencyList = dependencyList;
+      TypedefDeclarationInfo.Declaration = TypedefDeclaration;
+
+      std::pair<std::string, DeclarationInfo> TypedefDecl(
+          "typedef " + TD->getNameAsString(), TypedefDeclarationInfo);
+
+      utils->getUnresolvedDeclarations()->insert(TypedefDecl);
 
     } else if (UnderlyingType->isPointerType()) {
       bool isResolved = false;
@@ -436,33 +488,28 @@ private:
                               TD->getNameAsString() + ";\n";
         isResolved = true;
       } else {
-        if (shouldBeResolved) {
-          std::string DeclarationCore = "(*" + TD->getNameAsString() + ")";
-          checkPointerType(UnderlyingType->getPointeeType(), &isResolved,
-                           dependencyList, DeclarationCore);
+        std::string DeclarationCore = "(*" + TD->getNameAsString() + ")";
+        checkPointerType(UnderlyingType->getPointeeType(), &isResolved,
+                         dependencyList, DeclarationCore);
 
-          TypedefDeclaration += DeclarationCore + ";\n";
-          isResolved = false;
+        TypedefDeclaration += DeclarationCore + ";\n";
+        isResolved = false;
 
-          DeclarationInfo TypedefDeclarationInfo;
-          TypedefDeclarationInfo.isResolved = isResolved;
-          TypedefDeclarationInfo.dependencyList = dependencyList;
-          TypedefDeclarationInfo.Declaration = TypedefDeclaration;
+        DeclarationInfo TypedefDeclarationInfo;
+        TypedefDeclarationInfo.isResolved = isResolved;
+        TypedefDeclarationInfo.dependencyList = dependencyList;
+        TypedefDeclarationInfo.Declaration = TypedefDeclaration;
 
-          std::pair<std::string, DeclarationInfo> TypedefDecl(
-              "typedef " + TD->getNameAsString(), TypedefDeclarationInfo);
+        std::pair<std::string, DeclarationInfo> TypedefDecl(
+            "typedef " + TD->getNameAsString(), TypedefDeclarationInfo);
 
-          utils->getUnresolvedDeclarations()->insert(TypedefDecl);
-
-        } else {
-          TypedefDeclaration += "void* " + TD->getNameAsString() + ";\n";
-          isResolved = true;
-        }
+        utils->getUnresolvedDeclarations()->insert(TypedefDecl);
       }
       if (isResolved) {
         utils->getResolvedDecls()->insert("typedef " + TD->getNameAsString());
-        (*output) << TypedefDeclaration; // print the typedef
-        (*output) << "\n";
+        output += TypedefDeclaration; // print the typedef
+        output += "\n";
+
         delete dependencyList;
       }
     } else if (UnderlyingType->isArrayType()) {
@@ -477,29 +524,19 @@ private:
             Context->getAsConstantArrayType(UnderlyingType);
         ArrayDeclaration = utils->getArraySize(CAT);
         DeclarationCore += ArrayDeclaration;
-        if (CAT->getElementType()->isFunctionPointerType()) {
-          TypedefDeclaration += "void* " + DeclarationCore + ";\n";
-          isResolved = true;
-          utils->getResolvedDecls()->insert("typedef " + TD->getNameAsString());
-          (*output) << TypedefDeclaration;
-          (*output) << "\n";
-          delete dependencyList;
-        } else {
-          QualType Type;
-          Type = CAT->getElementType();
-          checkPointerType(Type, &isResolved, dependencyList, DeclarationCore);
-          TypedefDeclaration += DeclarationCore + ";\n";
+        checkPointerType(CAT->getElementType(), &isResolved, dependencyList,
+                         DeclarationCore);
+        TypedefDeclaration += DeclarationCore + ";\n";
 
-          DeclarationInfo TypedefDeclarationInfo;
-          TypedefDeclarationInfo.isResolved = isResolved;
-          TypedefDeclarationInfo.dependencyList = dependencyList;
-          TypedefDeclarationInfo.Declaration = TypedefDeclaration;
+        DeclarationInfo TypedefDeclarationInfo;
+        TypedefDeclarationInfo.isResolved = isResolved;
+        TypedefDeclarationInfo.dependencyList = dependencyList;
+        TypedefDeclarationInfo.Declaration = TypedefDeclaration;
 
-          std::pair<std::string, DeclarationInfo> TypedefDecl(
-              "typedef " + TD->getNameAsString(), TypedefDeclarationInfo);
+        std::pair<std::string, DeclarationInfo> TypedefDecl(
+            "typedef " + TD->getNameAsString(), TypedefDeclarationInfo);
 
-          utils->getUnresolvedDeclarations()->insert(TypedefDecl);
-        }
+        utils->getUnresolvedDeclarations()->insert(TypedefDecl);
       }
     } else if (const VectorType *VT = UnderlyingType->getAs<VectorType>()) {
       if (VT->getVectorKind() == VectorType::GenericVector &&
@@ -510,8 +547,8 @@ private:
             std::to_string(VT->getNumElements()) + " * sizeof(" +
             VT->getElementType().getAsString() + "))));\n";
         utils->getResolvedDecls()->insert("typedef " + TD->getNameAsString());
-        (*output) << TypedefDeclaration;
-        (*output) << "\n";
+        output += TypedefDeclaration;
+        output += "\n";
       }
     }
   }
@@ -562,13 +599,16 @@ private:
             AnonRecordDeclaration += "union ";
           }
 
+          AnonRecordDeclaration +=
+              FFIBindingsUtils::getInstance()->getDeclAttrs(RD);
           AnonRecordDeclaration += "{\n";
 
           for (RecordDecl::field_iterator FI = RD->field_begin();
                FI != RD->field_end(); ++FI) {
-            RecordsVisitor.checkFieldType(FI->getType(), FI->getNameAsString(),
-                                          isResolved, dependencyList,
-                                          AnonRecordDeclaration);
+            std::string FieldDeclaration = FI->getNameAsString();
+            RecordsVisitor.checkFieldType(FI->getType(), isResolved,
+                                          dependencyList, FieldDeclaration);
+            AnonRecordDeclaration += FieldDeclaration + ";\n";
           }
 
           AnonRecordDeclaration += "}";
@@ -608,7 +648,8 @@ private:
           std::vector<std::string> elements;
           std::string AnonEnumDeclaration;
 
-          AnonEnumDeclaration += "enum {";
+          std::string attrs = FFIBindingsUtils::getInstance()->getDeclAttrs(ED);
+          AnonEnumDeclaration += "enum " + attrs + "{";
 
           int length = 0;
           for (EnumDecl::enumerator_iterator EI = ED->enumerator_begin();
@@ -621,7 +662,7 @@ private:
             if (i < length - 1) {
               AnonEnumDeclaration += elements[i] + ", ";
             } else {
-              AnonEnumDeclaration += elements[i] + "} ";
+              AnonEnumDeclaration += elements[i] + "}";
             }
           }
           DeclarationCore = AnonEnumDeclaration + DeclarationCore;
@@ -648,7 +689,32 @@ private:
         }
       }
     } else if (ParameterType->isFunctionPointerType()) {
-      DeclarationCore = "void* " + DeclarationCore;
+      std::string FunctionPointerDeclarationCore;
+      const FunctionProtoType *FPT =
+          (const FunctionProtoType *)
+          ParameterType->getPointeeType()->getAs<FunctionType>();
+      std::string ReturnValueDeclaration;
+      FunctionsVisitor.checkParameterType(
+          FPT->getReturnType(), isResolved, dependencyList,
+          ReturnValueDeclaration, FunctionsVisitor.RETVAL);
+      DeclarationCore =
+          ReturnValueDeclaration + " (*" + DeclarationCore + ")" + "(";
+      unsigned int NumOfParams = FPT->getNumParams();
+      for (unsigned int i = 0; i < NumOfParams; i++) {
+        std::string ParameterDeclaration;
+        FunctionsVisitor.checkParameterType(
+            FPT->getParamType(i), isResolved, dependencyList,
+            ParameterDeclaration, FunctionsVisitor.PARAM);
+        FunctionPointerDeclarationCore += ParameterDeclaration;
+        if (i != NumOfParams - 1) {
+          FunctionPointerDeclarationCore += ", ";
+        }
+      }
+      if (FPT->isVariadic()) {
+        FunctionPointerDeclarationCore += ", ...";
+      }
+      FunctionPointerDeclarationCore += ")";
+      DeclarationCore += FunctionPointerDeclarationCore;
     } else if (ParameterType->isPointerType()) {
       DeclarationCore = "(*" + DeclarationCore + ")";
       checkPointerType(ParameterType->getPointeeType(), isResolved,
@@ -674,13 +740,15 @@ private:
                           VT->getElementType().getAsString() + "))))";
       }
     }
-    // TODO: Add support for pointers to functions
   }
 
   void resolveAnonRecord(RecordDecl *RD) {
 
     std::string AnonRecordName =
         RD->getTypeForDecl()->getCanonicalTypeInternal().getAsString();
+    std::string RecordDeclaration;
+    std::vector<std::string> *dependencyList = new std::vector<std::string>();
+    bool isResolved = true;
 
     char separator;
 #ifdef LLVM_ON_UNIX
@@ -719,33 +787,36 @@ private:
     AnonRecordName = AnonRecordName.substr(
         firstindex + 1, AnonRecordName.find_first_of(':') - firstindex - 1);
     std::replace(AnonRecordName.begin(), AnonRecordName.end(), '.', '_');
+    std::replace(AnonRecordName.begin(), AnonRecordName.end(), '-', '_');
     AnonRecordName =
         "Anonymous_" + AnonRecordName + "_" + std::to_string(distance);
 
+    std::string attrs = FFIBindingsUtils::getInstance()->getDeclAttrs(RD);
+
     if (RD->getTypeForDecl()->isStructureType()) {
+      RecordDeclaration = "struct " + attrs + AnonRecordName;
       AnonRecordName = "struct " + AnonRecordName;
     } else if (RD->getTypeForDecl()->isUnionType()) {
+      RecordDeclaration = "union " + attrs + AnonRecordName;
       AnonRecordName = "union " + AnonRecordName;
     }
 
-    std::string RecordDeclaration;
-    std::vector<std::string> *dependencyList = new std::vector<std::string>();
-    bool isResolved = true;
-    RecordDeclaration = AnonRecordName + " {\n";
+    RecordDeclaration += " {\n";
     // check the fields
     for (RecordDecl::field_iterator FI = RD->field_begin();
          FI != RD->field_end(); ++FI) {
-      RecordsVisitor.checkFieldType(FI->getType(), FI->getNameAsString(),
-                                    &isResolved, dependencyList,
-                                    RecordDeclaration);
+      std::string FieldDeclaration = FI->getNameAsString();
+      RecordsVisitor.checkFieldType(FI->getType(), &isResolved, dependencyList,
+                                    FieldDeclaration);
+      RecordDeclaration += FieldDeclaration + ";\n";
     }
     RecordDeclaration += "};\n";
 
     if (isResolved) {
       FFIBindingsUtils::getInstance()->getResolvedDecls()->insert(
           AnonRecordName);
-      (*output) << RecordDeclaration;
-      (*output) << "\n";
+      output += RecordDeclaration;
+      output += "\n";
       delete dependencyList;
     } else {
       // add this record to list of unresolved declarations
@@ -759,6 +830,64 @@ private:
       FFIBindingsUtils::getInstance()->getUnresolvedDeclarations()->insert(
           Record);
     }
+  }
+
+  /**
+   * Determine whether this declaration depends on itself (directly or
+   * indirectly).
+   */
+  bool DependsOnItself(std::string DeclName,
+                       std::vector<std::string> *dependencyList) {
+    // Direct and indirect dependencies of this declaration
+    std::stack<std::string> Dependencies;
+    // Declarations that have already been checked
+    std::set<std::string> CheckedDecls;
+
+    for (std::vector<std::string>::iterator dependency =
+             dependencyList->begin();
+         dependency != dependencyList->end(); ++dependency) {
+      if (utils->isInUnresolvedDeclarations(*dependency)) {
+        Dependencies.push(*dependency);
+        CheckedDecls.insert(*dependency);
+      }
+    }
+    while (Dependencies.size()) {
+      std::string DeclToCheck = Dependencies.top();
+      Dependencies.pop();
+      if (DeclToCheck == DeclName) {
+        return true;
+      }
+      DeclarationInfo depDecl =
+          utils->getUnresolvedDeclarations()->at(DeclToCheck);
+      if (!utils->isInResolvedDecls(DeclToCheck) &&
+          !DependsOnItselfDirectly(DeclToCheck, depDecl.dependencyList)) {
+        for (std::vector<std::string>::iterator dependency =
+                 depDecl.dependencyList->begin();
+             dependency != depDecl.dependencyList->end(); ++dependency) {
+          if (utils->isInUnresolvedDeclarations(*dependency) &&
+              (CheckedDecls.find(*dependency) == CheckedDecls.end())) {
+            Dependencies.push(*dependency);
+            CheckedDecls.insert(*dependency);
+          }
+        }
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Determine whether this declaration depends on itself directly.
+   */
+  bool DependsOnItselfDirectly(std::string DeclName,
+                               std::vector<std::string> *dependencyList) {
+    for (std::vector<std::string>::iterator dependency =
+             dependencyList->begin();
+         dependency != dependencyList->end(); ++dependency) {
+      if (*dependency == DeclName) {
+        return true;
+      }
+    }
+    return false;
   }
 };
 

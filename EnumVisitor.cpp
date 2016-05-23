@@ -1,10 +1,11 @@
 #include "GenerateFFIBindings.hpp"
 
-void EnumVisitor::setOutput(llvm::raw_fd_ostream *output_) { output = output_; }
+void EnumVisitor::setOutput(std::string *output_) { output = output_; }
 
 bool EnumVisitor::VisitEnumDecl(EnumDecl *ED) {
 
   if (ED->hasAttr<FFIBindingAttr>()) {
+    FFIBindingsUtils::getInstance()->setHasMarkedDeclarations(true);
 
     if (FFIBindingsUtils::getInstance()->isOnBlacklist("enum " +
                                                        ED->getNameAsString()) ||
@@ -15,12 +16,18 @@ bool EnumVisitor::VisitEnumDecl(EnumDecl *ED) {
     std::string EnumDeclaration;
     std::vector<std::string> elements;
 
-    EnumDeclaration = "enum " + ED->getNameAsString() + " {";
+    std::string attrs = FFIBindingsUtils::getInstance()->getDeclAttrs(ED);
+    EnumDeclaration = "enum " + attrs + ED->getNameAsString() + " {";
 
     int length = 0;
     for (EnumDecl::enumerator_iterator EI = ED->enumerator_begin();
          EI != ED->enumerator_end(); ++EI) {
-      elements.push_back(EI->getNameAsString());
+      SmallString<32> EnumValue(EI->getNameAsString());
+      if (EI->getInitExpr()) {
+        EnumValue += " = ";
+        EI->getInitVal().toString(EnumValue);
+      }
+      elements.push_back(EnumValue.str());
       length++;
     }
 
@@ -32,8 +39,8 @@ bool EnumVisitor::VisitEnumDecl(EnumDecl *ED) {
       }
     }
 
-    (*output) << EnumDeclaration; // print the enumeration
-    (*output) << "\n";
+    (*output) += EnumDeclaration; // print the enumeration
+    (*output) += "\n";
     FFIBindingsUtils::getInstance()->getResolvedDecls()->insert(
         "enum " + ED->getNameAsString());
   }

@@ -1,8 +1,8 @@
 #include "GenerateFFIBindings.hpp"
 
-void FunctionVisitor::setOutput(llvm::raw_fd_ostream *output_) {
-  output = output_;
-}
+ASTContext *FunctionVisitor::Context;
+
+void FunctionVisitor::setOutput(std::string *output_) { output = output_; }
 
 void
 FunctionVisitor::checkParameterType(QualType ParameterType, bool *isResolved,
@@ -28,6 +28,7 @@ FunctionVisitor::checkParameterType(QualType ParameterType, bool *isResolved,
       TypedefTypeDeclaration.Declaration = TD;
       TypedefTypeDeclaration.TypeName =
           "typedef " + ParameterType.getAsString();
+
       *isResolved = false;
       dependencyList->push_back("typedef " + ParameterType.getAsString());
 
@@ -101,25 +102,18 @@ FunctionVisitor::checkParameterType(QualType ParameterType, bool *isResolved,
         AnonRecordName = AnonRecordName.substr(
             firstindex + 1, AnonRecordName.find_first_of(':') - firstindex - 1);
         std::replace(AnonRecordName.begin(), AnonRecordName.end(), '.', '_');
+        std::replace(AnonRecordName.begin(), AnonRecordName.end(), '-', '_');
         AnonRecordName =
             "Anonymous_" + AnonRecordName + "_" + std::to_string(distance);
-
         if (RT->isStructureType()) {
           AnonRecordName = "struct " + AnonRecordName;
         } else if (RT->isUnionType()) {
           AnonRecordName = "union " + AnonRecordName;
         }
-
         *isResolved = false;
 
         RecordTypeDeclaration.TypeName = AnonRecordName;
         dependencyList->push_back(AnonRecordName);
-
-        if (DeclarationCore == "") {
-          DeclarationCore = AnonRecordName;
-        } else {
-          DeclarationCore = AnonRecordName + " " + DeclarationCore;
-        }
 
         if (!FFIBindingsUtils::getInstance()->isInResolvedDecls(
                  AnonRecordName) &&
@@ -129,20 +123,26 @@ FunctionVisitor::checkParameterType(QualType ParameterType, bool *isResolved,
               RecordTypeDeclaration);
         }
 
+        if (DeclarationCore == "") {
+          DeclarationCore = AnonRecordName;
+        } else {
+          DeclarationCore = AnonRecordName + " " + DeclarationCore;
+        }
       } else {
         RecordTypeDeclaration.TypeName = ParameterType.getAsString();
+
         *isResolved = false;
         dependencyList->push_back(ParameterType.getAsString());
+
+        if (FFIBindingsUtils::getInstance()->isNewType(ParameterType)) {
+          FFIBindingsUtils::getInstance()->getDeclsToFind()->push(
+              RecordTypeDeclaration);
+        }
 
         if (DeclarationCore == "") {
           DeclarationCore = ParamTypeFull.getAsString();
         } else {
           DeclarationCore = ParamTypeFull.getAsString() + " " + DeclarationCore;
-        }
-
-        if (FFIBindingsUtils::getInstance()->isNewType(ParameterType)) {
-          FFIBindingsUtils::getInstance()->getDeclsToFind()->push(
-              RecordTypeDeclaration);
         }
       }
     }
@@ -164,7 +164,8 @@ FunctionVisitor::checkParameterType(QualType ParameterType, bool *isResolved,
         std::vector<std::string> elements;
         std::string EnumDeclaration;
 
-        EnumDeclaration += "enum {";
+        std::string attrs = FFIBindingsUtils::getInstance()->getDeclAttrs(ED);
+        EnumDeclaration += "enum " + attrs + "{";
 
         int length = 0;
         for (EnumDecl::enumerator_iterator EI = ED->enumerator_begin();
@@ -177,7 +178,7 @@ FunctionVisitor::checkParameterType(QualType ParameterType, bool *isResolved,
           if (i < length - 1) {
             EnumDeclaration += elements[i] + ", ";
           } else {
-            EnumDeclaration += elements[i] + "} ";
+            EnumDeclaration += elements[i] + "}";
           }
         }
         DeclarationCore = EnumDeclaration + DeclarationCore;
@@ -202,11 +203,30 @@ FunctionVisitor::checkParameterType(QualType ParameterType, bool *isResolved,
       }
     }
   } else if (ParameterType->isFunctionPointerType()) {
-    if (DeclarationCore == "") {
-      DeclarationCore = "void*";
-    } else {
-      DeclarationCore = "void* " + DeclarationCore;
+    std::string FunctionPointerDeclarationCore;
+    const FunctionProtoType *FPT =
+        (const FunctionProtoType *)
+        ParameterType->getPointeeType()->getAs<FunctionType>();
+    std::string ReturnValueDeclaration;
+    checkParameterType(FPT->getReturnType(), isResolved, dependencyList,
+                       ReturnValueDeclaration, RETVAL);
+    DeclarationCore =
+        ReturnValueDeclaration + " (*" + DeclarationCore + ")" + "(";
+    unsigned int NumOfParams = FPT->getNumParams();
+    for (unsigned int i = 0; i < NumOfParams; i++) {
+      std::string ParameterDeclaration;
+      checkParameterType(FPT->getParamType(i), isResolved, dependencyList,
+                         ParameterDeclaration, parameterType);
+      FunctionPointerDeclarationCore += ParameterDeclaration;
+      if (i != NumOfParams - 1) {
+        FunctionPointerDeclarationCore += ", ";
+      }
     }
+    if (FPT->isVariadic()) {
+      FunctionPointerDeclarationCore += ", ...";
+    }
+    FunctionPointerDeclarationCore += ")";
+    DeclarationCore += FunctionPointerDeclarationCore;
   } else if (ParameterType->isPointerType()) {
     if (parameterType == RETVAL) {
       checkParameterType(ParameterType->getPointeeType(), isResolved,
@@ -240,7 +260,6 @@ FunctionVisitor::checkParameterType(QualType ParameterType, bool *isResolved,
                         VT->getElementType().getAsString() + "))))";
     }
   }
-  // TODO: Add support for pointers to functions
 }
 
 bool FunctionVisitor::VisitFunctionDecl(FunctionDecl *FD) {
@@ -250,6 +269,7 @@ bool FunctionVisitor::VisitFunctionDecl(FunctionDecl *FD) {
       return true;
     }
   }
+  FFIBindingsUtils::getInstance()->setHasMarkedDeclarations(true);
 
   if (FFIBindingsUtils::getInstance()->isInResolvedDecls(
           "function " + FD->getQualifiedNameAsString()) ||
@@ -309,8 +329,6 @@ bool FunctionVisitor::VisitFunctionDecl(FunctionDecl *FD) {
         FunctionDeclaration += ", ";
       }
       i++;
-      // TODO: If the parameter is e.g. a pointer to a pointer to a function,
-      // that is not yet supported.
     }
 
     if (FD->isVariadic()) {
@@ -322,8 +340,8 @@ bool FunctionVisitor::VisitFunctionDecl(FunctionDecl *FD) {
   if (isResolved) {
     FFIBindingsUtils::getInstance()->getResolvedDecls()->insert(
         "function " + FD->getQualifiedNameAsString());
-    (*output) << FunctionDeclaration;
-    (*output) << "\n";
+    (*output) += FunctionDeclaration;
+    (*output) += "\n";
     delete dependencyList;
   } else {
     DeclarationInfo FunctionDeclarationInfo;

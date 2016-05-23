@@ -95,3 +95,37 @@ QualType FFIBindingsUtils::handleMultiDimArrayType(
 
   return ElementType;
 }
+
+std::string FFIBindingsUtils::getDeclAttrs(Decl *D) {
+
+  std::string attrList;
+  if (!D->hasAttrs())
+    return attrList;
+  int numOfAttrs = 0;
+
+  for (Attr *attr : D->getAttrs()) {
+    if (attr->getKind() == attr::Kind::Packed) {
+      if (numOfAttrs > 0) {
+        attrList = ", " + attrList;
+      }
+      attrList = "packed" + attrList;
+      numOfAttrs++;
+    } else if (attr->getKind() == attr::Kind::Aligned) {
+      if (numOfAttrs > 0) {
+        attrList = ", " + attrList;
+      }
+      SourceLocation beginLoc = attr->getRange().getBegin();
+      SourceLocation endLoc = attr->getRange().getEnd();
+      const char *begin =
+          D->getASTContext().getSourceManager().getCharacterData(beginLoc);
+      const char *end =
+          D->getASTContext().getSourceManager().getCharacterData(endLoc);
+      attrList = std::string(begin, end + 1 - begin) + attrList;
+      numOfAttrs++;
+    }
+  }
+
+  if (numOfAttrs)
+    attrList = "__attribute__((" + attrList + ")) ";
+  return attrList;
+}

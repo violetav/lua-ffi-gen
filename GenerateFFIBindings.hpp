@@ -23,10 +23,6 @@ struct TypeDeclaration {
   /** Declaration node. The information that it contains depends on the type of
    * the declaration (function, struct, enum, etc.). */
   TypeDecl *Declaration;
-  /** Should this declaration be resolved or not.
-   *  This flag is currently used with pointers - should the type that they
-   * point to be resolved or not. */
-  bool shouldBeResolved = true;
 };
 
 /**
@@ -51,17 +47,6 @@ struct DeclarationInfo {
 class FunctionVisitor : public RecursiveASTVisitor<FunctionVisitor> {
 public:
   FunctionVisitor() {}
-  explicit FunctionVisitor(ASTContext *Context) : Context(Context) {}
-
-  /** Visits function declarations in a parsed AST. */
-  bool VisitFunctionDecl(FunctionDecl *FD);
-  /** Set output stream for writing output to a file. */
-  void setOutput(llvm::raw_fd_ostream *output_);
-
-private:
-  ASTContext *Context;
-  /** Output stream for writing the output to a file. */
-  llvm::raw_fd_ostream *output;
   /** Handles the function parameter type and modifies information about
    *  the function declaration (adds declarations that it depends on, if there
    * are any, etc.). */
@@ -69,9 +54,19 @@ private:
     RETVAL,
     PARAM
   };
-  void checkParameterType(QualType ParameterType, bool *isResolved,
-                          std::vector<std::string> *dependencyList,
-                          std::string &DeclarationCore, enum Type type);
+
+  /** Visits function declarations in a parsed AST. */
+  bool VisitFunctionDecl(FunctionDecl *FD);
+  /** Set output string for writing output to a file. */
+  void setOutput(std::string *output_);
+  static void checkParameterType(QualType ParameterType, bool *isResolved,
+                                 std::vector<std::string> *dependencyList,
+                                 std::string &DeclarationCore, enum Type type);
+
+private:
+  static ASTContext *Context;
+  /** Output string for writing the output to a file. */
+  std::string *output;
 };
 
 /**
@@ -81,8 +76,6 @@ private:
 class RecordVisitor : public RecursiveASTVisitor<RecordVisitor> {
 public:
   RecordVisitor() {}
-  explicit RecordVisitor(ASTContext *Context) : Context(Context) {}
-
   /** Visits record declarations in a parsed AST. */
   bool VisitRecordDecl(RecordDecl *RD);
   /** Tries to resolve given record declaration. If it can be immediately
@@ -92,17 +85,17 @@ public:
   /** Handles the record's field type and modifies information about
    *  the record declaration (adds declarations that it depends on, if there are
    * any, etc.). */
-  void checkFieldType(QualType FieldType, std::string FieldName,
-                      bool *isResolved,
+  void checkFieldType(QualType FieldType, bool *isResolved,
                       std::vector<std::string> *dependencyList,
                       std::string &RecordDeclaration);
-  /** Set output stream for writing output to a file. */
-  void setOutput(llvm::raw_fd_ostream *output_);
+  /** Set output string for writing output to a file. */
+  void setOutput(std::string *output_);
+  void setContext(ASTContext *astContext) { Context = astContext; }
 
 private:
   ASTContext *Context;
-  /** Output stream for writing the output to a file. */
-  llvm::raw_fd_ostream *output;
+  /** Output string for writing the output to a file. */
+  std::string *output;
 };
 
 /**
@@ -111,17 +104,16 @@ private:
 class EnumVisitor : public RecursiveASTVisitor<EnumVisitor> {
 public:
   EnumVisitor() {}
-  explicit EnumVisitor(ASTContext *Context) : Context(Context) {}
-
   /** Visits enum declarations in a parsed AST. */
   bool VisitEnumDecl(EnumDecl *ED);
-  /** Set output stream for writing output to a file. */
-  void setOutput(llvm::raw_fd_ostream *output_);
+  /** Set output string for writing output to a file. */
+  void setOutput(std::string *output_);
+  void setContext(ASTContext *astContext) { Context = astContext; }
 
 private:
   ASTContext *Context;
-  /** Output stream for writing the output to a file. */
-  llvm::raw_fd_ostream *output;
+  /** Output string for writing the output to a file. */
+  std::string *output;
 };
 
 class FFIBindingsUtils {
@@ -150,6 +142,9 @@ public:
   /** Get size of the array (e.g. for "double arr[6]" return value would be
    * "[6]"). */
   std::string getArraySize(const ConstantArrayType *CAT);
+  /** Returns a string containing the list of attributes attached to this
+   * Decl.*/
+  std::string getDeclAttrs(Decl *RD);
 
   std::map<std::string, DeclarationInfo> *getUnresolvedDeclarations() {
     return UnresolvedDeclarations;
@@ -210,6 +205,12 @@ public:
     delete AnonymousRecords;
   }
 
+  bool hasMarkedDeclarations() { return markedDeclarations; }
+
+  void setHasMarkedDeclarations(bool markedDeclarations_) {
+    markedDeclarations = markedDeclarations_;
+  }
+
 private:
   static FFIBindingsUtils *instance;
   FFIBindingsUtils() {
@@ -239,5 +240,6 @@ private:
   std::set<std::string> *blacklist;
   bool isTestingMode = false;
   std::vector<std::string> *AnonymousRecords;
+  bool markedDeclarations = false;
 };
 #endif /* GENERATEFFIBINDINGS_H */
