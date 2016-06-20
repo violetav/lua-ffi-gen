@@ -47,26 +47,8 @@ struct DeclarationInfo {
 class FunctionVisitor : public RecursiveASTVisitor<FunctionVisitor> {
 public:
   FunctionVisitor() {}
-  /** Handles the function parameter type and modifies information about
-   *  the function declaration (adds declarations that it depends on, if there
-   * are any, etc.). */
-  enum Type {
-    RETVAL,
-    PARAM
-  };
-
   /** Visits function declarations in a parsed AST. */
   bool VisitFunctionDecl(FunctionDecl *FD);
-  /** Set output string for writing output to a file. */
-  void setOutput(std::string *output_);
-  static void checkParameterType(QualType ParameterType, bool *isResolved,
-                                 std::vector<std::string> *dependencyList,
-                                 std::string &DeclarationCore, enum Type type);
-
-private:
-  static ASTContext *Context;
-  /** Output string for writing the output to a file. */
-  std::string *output;
 };
 
 /**
@@ -78,24 +60,6 @@ public:
   RecordVisitor() {}
   /** Visits record declarations in a parsed AST. */
   bool VisitRecordDecl(RecordDecl *RD);
-  /** Tries to resolve given record declaration. If it can be immediately
-   * resolved it is printed out, otherwise further actions that are needed for
-   * it to be resolved are done. */
-  void findRecordDeclaration(RecordDecl *RD);
-  /** Handles the record's field type and modifies information about
-   *  the record declaration (adds declarations that it depends on, if there are
-   * any, etc.). */
-  void checkFieldType(QualType FieldType, bool *isResolved,
-                      std::vector<std::string> *dependencyList,
-                      std::string &RecordDeclaration);
-  /** Set output string for writing output to a file. */
-  void setOutput(std::string *output_);
-  void setContext(ASTContext *astContext) { Context = astContext; }
-
-private:
-  ASTContext *Context;
-  /** Output string for writing the output to a file. */
-  std::string *output;
 };
 
 /**
@@ -106,18 +70,37 @@ public:
   EnumVisitor() {}
   /** Visits enum declarations in a parsed AST. */
   bool VisitEnumDecl(EnumDecl *ED);
-  /** Set output string for writing output to a file. */
-  void setOutput(std::string *output_);
-  void setContext(ASTContext *astContext) { Context = astContext; }
+};
 
-private:
-  ASTContext *Context;
-  /** Output string for writing the output to a file. */
-  std::string *output;
+/**
+ * Finds typedefs marked with the ffibinding attribute and gathers data about
+ * them that's needed to resolve them (print them out)
+ **/
+class TypedefVisitor : public RecursiveASTVisitor<TypedefVisitor> {
+public:
+  TypedefVisitor() {}
+  /** Visits typedef declarations in a parsed AST. */
+  bool VisitTypedefDecl(TypedefNameDecl *TD);
 };
 
 class FFIBindingsUtils {
 public:
+  /** Type passed to checkType(), to determine whether the type being
+   * checked is function parameter or return value, or neither.
+   */
+  enum ParamType {
+    RETVAL,
+    PARAM,
+    NONE
+  };
+  /** Type passed to checkType(), to determine whether the type being
+   * checked came from a function or other declaration.
+   */
+  enum ParentDeclType {
+    FUNCTION,
+    NORMAL
+  };
+
   static FFIBindingsUtils *getInstance();
   /** Is this the first time to come across given declaration type.
    *  Returns false if the type is already resolved, waiting to be resolved or
@@ -132,13 +115,6 @@ public:
   /** Returns true if this type should not be resolved and emitted because it is
    * on the blacklist, false otherwise. */
   bool isOnBlacklist(std::string DeclType);
-
-  /** Used for handling multi-dimensional arrays.
-   *  As long as there are more dimensions found, they are appended to the array
-   * declaration.
-   *  Return value is the type of the array elements. */
-  QualType handleMultiDimArrayType(ASTContext *Context, QualType ArrayType,
-                                   std::string &ArrayDeclaration);
   /** Get size of the array (e.g. for "double arr[6]" return value would be
    * "[6]"). */
   std::string getArraySize(const ConstantArrayType *CAT);
@@ -150,22 +126,9 @@ public:
     return UnresolvedDeclarations;
   }
 
-  void setUnresolvedDeclarations(
-      std::map<std::string, DeclarationInfo> *UnresolvedDeclarations_) {
-    UnresolvedDeclarations = UnresolvedDeclarations_;
-  }
-
   std::stack<TypeDeclaration> *getDeclsToFind() { return DeclsToFind; }
 
-  void setDeclsToFind(std::stack<TypeDeclaration> *DeclsToFind_) {
-    DeclsToFind = DeclsToFind_;
-  }
-
   std::set<std::string> *getResolvedDecls() { return ResolvedDecls; }
-
-  void setResolvedDecls(std::set<std::string> *ResolvedDecls_) {
-    ResolvedDecls = ResolvedDecls_;
-  }
 
   std::string getOutputFileName() { return outputFileName; }
 
@@ -189,8 +152,6 @@ public:
 
   std::set<std::string> *getBlacklist() { return blacklist; }
 
-  void setBlacklist(std::set<std::string> *list) { blacklist = list; }
-
   bool isTestingModeOn() { return isTestingMode; }
 
   void setTestingMode(bool testingMode) { isTestingMode = testingMode; }
@@ -210,6 +171,49 @@ public:
   void setHasMarkedDeclarations(bool markedDeclarations_) {
     markedDeclarations = markedDeclarations_;
   }
+
+  void setOutput(std::string *output_) { output = output_; }
+
+  void setContext(ASTContext *astContext) { Context = astContext; }
+
+  /** Try to resolve given anonymous record declaration. */
+  void resolveAnonRecord(RecordDecl *RD);
+
+  /** Prints out the given enum declaration. */
+  void resolveEnumDecl(EnumDecl *ED);
+
+  /** Tries to resolve given function declaration. If it can be immediately
+   * resolved it is printed out, otherwise further actions that are needed for
+   * it to be resolved are done. */
+  void resolveFunctionDecl(FunctionDecl *FD);
+
+  /** Tries to resolve given record declaration. If it can be immediately
+   * resolved it is printed out, otherwise further actions that are needed for
+   * it to be resolved are done. */
+  void resolveRecordDecl(RecordDecl *RD);
+
+  /** Tries to resolve given typedef declaration. If it can be immediately
+   * resolved it is printed out, otherwise further actions that are needed for
+   * it to be resolved are done. */
+  void resolveTypedefDecl(TypedefNameDecl *TD);
+
+  /** Add this type to the parent declaration for printing and determine whether
+   * the parent depends on it and needs to wait for it to be resolved.
+   *  @param Type             Type to check
+   *  @param isResolved       Flag to determine whether parent declaration is
+   * resolved or not
+   *  @param dependencyList   List of types that parent declaration depends on
+   *  @param DeclarationCore  Current parent declaration (what will be printed).
+   * This type should be appended to it in a certain way.
+   *  @param parentType       Type of the parent declaration (function or other)
+   *  @param parameterType    Type of the type being checked (parameter (PARAM),
+   * return value (RETVAL) or neither (NONE). Used in the case when parentType
+   * is FUNCTION.
+   * */
+  void checkType(QualType Type, bool *isResolved,
+                 std::vector<std::string> *dependencyList,
+                 std::string &DeclarationCore, enum ParentDeclType parentType,
+                 enum ParamType parameterType);
 
 private:
   static FFIBindingsUtils *instance;
@@ -232,14 +236,19 @@ private:
   std::stack<TypeDeclaration> *DeclsToFind;
   /** A list of resolved (printed out) declarations. */
   std::set<std::string> *ResolvedDecls;
-
+  std::vector<std::string> *AnonymousRecords;
   std::string outputFileName = "";
   std::string headerFileName = "";
   std::string blacklistFileName = "";
   std::string destinationDirectory = "";
   std::set<std::string> *blacklist;
+  ASTContext *Context;
+  /** Output string for writing the output to a file. */
+  std::string *output;
+  /** This flag is set to true when 'test' is passed on the command line. */
   bool isTestingMode = false;
-  std::vector<std::string> *AnonymousRecords;
+  /** Used to check if the plugin should generate an output .lua file. Remains
+   * false if there are no declarations marked with the ffibinding attribute. */
   bool markedDeclarations = false;
 };
 #endif /* GENERATEFFIBINDINGS_H */
